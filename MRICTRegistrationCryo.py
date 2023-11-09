@@ -233,21 +233,14 @@ class SegmentEditorEffectLogic(ScriptedLoadableModuleLogic):
     The values in this transform are the same as in the training transform preprocessing.
     """
     if modality == "CT":
-      trans = [SlicerLoadImage(keys=["image"]), AddChanneld(keys=["image"]),
-               Spacingd(keys=["image"], pixdim=(1.5, 1.5, 2.0), mode="bilinear"),
-               Orientationd(keys=["image"], axcodes="RAS"),
-               ScaleIntensityRanged(keys=["image"], a_min=-57, a_max=164, b_min=0.0, b_max=1.0, clip=True),
-               AddChanneld(keys=["image"]),
-               ToTensord(keys=["image"]), ]
-      return Compose(trans)
+        trans = [SlicerLoadImage(keys=["image"]), AddChanneld(keys=["image"]), Spacingd(keys=["image"], pixdim=(1.5, 1.5, 2.0), mode="bilinear"), Orientationd(keys=["image"], axcodes="RAS"), ScaleIntensityRanged(keys=["image"], a_min=-57, a_max=164, b_min=0.0, b_max=1.0, clip=True), AddChanneld(keys=["image"]), ToTensord(keys=["image"])]
+               
+        return Compose(trans)
+        
     elif modality == "MRI":
-      trans = [SlicerLoadImage(keys=["image"]), AddChanneld(keys=["image"]),
-               Spacingd(keys=["image"], pixdim=(1.5, 1.5, 2.0), mode="bilinear"),
-               Orientationd(keys=["image"], axcodes="LPS"),
-               Normalized(keys=["image"]),
-               AddChanneld(keys=["image"]),
-               ToTensord(keys=["image"])]
-      return Compose(trans)
+        trans = [SlicerLoadImage(keys=["image"]), AddChanneld(keys=["image"]), Spacingd(keys=["image"], pixdim=(1.5, 1.5, 2.0), mode="bilinear"), Orientationd(keys=["image"], axcodes="LPS"), Normalized(keys=["image"]), AddChanneld(keys=["image"]), ToTensord(keys=["image"])]
+               
+        return Compose(trans)
 
   @classmethod
   def getPostProcessingTransform(cls, original_spacing, original_size, modality):
@@ -261,7 +254,7 @@ class SegmentEditorEffectLogic(ScriptedLoadableModuleLogic):
     ])
 
   @classmethod
-  def launchLiverSegmentation(cls, in_out_volume_node, use_cuda, modality):
+  def launchLiverSegmentation(cls, in_volume_node, out_volume_node, use_cuda, modality):
     """
     Runs the segmentation on the input volume and returns the segmentation in the same volume.
     """
@@ -272,11 +265,12 @@ class SegmentEditorEffectLogic(ScriptedLoadableModuleLogic):
       with torch.no_grad():
         model_path = os.path.join(os.path.dirname(__file__),
                                   "liver_ct_model.pt" if modality == "CT" else "liver_mri_model.pt")
-
+        print("Model path: ", model_path)
         model = cls.createUNetModel(device=device)
         model.load_state_dict(torch.load(model_path, map_location=device))
-
-        transform_output = cls.getPreprocessingTransform(modality)(in_out_volume_node)
+        print("Model loaded .. ")
+        transform_output = cls.getPreprocessingTransform(modality)(in_volume_node)
+        print("Transform with MONAI applied .. ")
         model_input = transform_output["image"].to(device)
 
         print("Run UNet model on input volume")
@@ -289,7 +283,10 @@ class SegmentEditorEffectLogic(ScriptedLoadableModuleLogic):
         discrete_output = AsDiscrete(argmax=True)(model_output.reshape(model_output.shape[-4:]))
         post_processed = KeepLargestConnectedComponent(applied_labels=[1])(discrete_output)
         output_volume = post_processed.cpu().numpy()[0, :, :, :]
-
+        
+        print(transform_output["image"])
+        print(transform_output["image"].max())
+        
         del post_processed, discrete_output, model_output, model, model_input
 
         transform_output["image"] = output_volume
@@ -304,8 +301,8 @@ class SegmentEditorEffectLogic(ScriptedLoadableModuleLogic):
 
         output_affine_matrix = transform_output["image_meta_dict"]["affine"]
 
-        in_out_volume_node.SetIJKToRASMatrix(slicer.util.vtkMatrixFromArray(output_affine_matrix))
-        slicer.util.updateVolumeFromArray(in_out_volume_node, np.swapaxes(label_map_input, 0, 2))
+        out_volume_node.SetIJKToRASMatrix(slicer.util.vtkMatrixFromArray(output_affine_matrix))
+        slicer.util.updateVolumeFromArray(out_volume_node, np.swapaxes(label_map_input, 0, 2))
         del transform_output
 
     finally:
@@ -365,6 +362,17 @@ class MRICTRegistrationCryoWidget(ScriptedLoadableModuleWidget, VTKObservationMi
         self.logic = None
         self._parameterNode = None
         self._updatingGUIFromParameterNode = False
+        
+        #Copied from class SegmentEditorEffect(AbstractScriptedSegmentEditorEffect):
+        
+        self.device = None
+        self.modality = None
+        self.clippedMasterImageData = None
+        self.lastRoiNodeId = ""
+        self.lastRoiNodeModifiedTime = 0
+        self.roiSelector = slicer.qMRMLNodeComboBox()
+        
+        #Copied from class SegmentEditorEffect(AbstractScriptedSegmentEditorEffect)
 
     def setup(self):
         
@@ -439,12 +447,30 @@ class MRICTRegistrationCryoWidget(ScriptedLoadableModuleWidget, VTKObservationMi
         #
         advancedCollapsibleButton = ctk.ctkCollapsibleButton()
         advancedCollapsibleButton.text = "Advanced"
-        advancedCollapsibleButton.collapsed = 1
+        advancedCollapsibleButton.collapsed = 0
         self.layout.addWidget(advancedCollapsibleButton)
 
-        # Layout within the dummy collapsible button
+        ## Layout within the dummy collapsible button
         advancedFormLayout = qt.QFormLayout(advancedCollapsibleButton)
-
+        
+        self.deviceSelector = qt.QComboBox()
+        self.deviceSelector.addItems(["cuda", "cpu"])
+        advancedFormLayout.addRow("Device:", self.deviceSelector)
+        
+        ## Add ROI CT options
+        self.roiSelectorCT = slicer.qMRMLNodeComboBox()
+        self.roiSelectorCT.nodeTypes = ['vtkMRMLMarkupsROINode']
+        self.roiSelectorCT.noneEnabled = True
+        self.roiSelectorCT.setMRMLScene(slicer.mrmlScene)
+        advancedFormLayout.addRow("ROI CT: ", self.roiSelectorCT)
+        
+        ## Add ROI CT options
+        self.roiSelectorMRI = slicer.qMRMLNodeComboBox()
+        self.roiSelectorMRI.nodeTypes = ['vtkMRMLMarkupsROINode']
+        self.roiSelectorMRI.noneEnabled = True
+        self.roiSelectorMRI.setMRMLScene(slicer.mrmlScene)
+        advancedFormLayout.addRow("ROI MRI: ", self.roiSelectorMRI)
+        
             
         #
         # Apply Button
@@ -663,8 +689,6 @@ class MRICTRegistrationCryoLogic(ScriptedLoadableModuleLogic):
         Run the processing algorithm.
         """
         
-        #outputVolume = inputFixedVolume #Temporary statement. Just to make the code run initially as now I am not writing the process to generate the output volume. Need to be removed otherwise it doesnt make sense
-        
         if not inputFixedVolume or not inputMovingVolume or not outputVolume:
             raise ValueError("Input or output volume is missing or invalid")
 
@@ -673,18 +697,26 @@ class MRICTRegistrationCryoLogic(ScriptedLoadableModuleLogic):
         
         # Start execution in the background
         
-        inputMovingVolume = self.f_n4itkbiasfieldcorrection(inputMovingVolume)
-        #outputVolume = inputMovingVolume
-        
         #Segment the liver from CT using AI based segmentation module RVX
-        inputFixedVolumeMask = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLScalarVolumeNode")
-        self.f_segmentationMask(inputFixedVolume, inputFixedVolumeMask, 1, "CT")
+        inputFixedVolumeMask = slicer.vtkMRMLScalarVolumeNode()
+        inputFixedVolumeMask.SetName('inputFixedVolumeMask')
+        
+        #slicer.mrmlScene.AddNode(inputFixedVolumeMask)
+        self.f_segmentationMask(inputFixedVolume, inputFixedVolumeMask, "cpu", "CT")
+        
+        #Correct bias using N4 filter
+        movingVolumeN4 = self.f_n4itkbiasfieldcorrection(inputMovingVolume)
+        movingVolumeN4.SetName('movingVolumeN4')
+        #slicer.mrmlScene.AddNode(movingVolumeN4)
         
         #Segment the liver from MRI using AI based segmentation module RVX
-        inputMovingVolumeMask = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLScalarVolumeNode")
-        self.f_segmentationMask(inputMovingVolume, inputMovingVolumeMask, 1, "MRI")
+        inputMovingVolumeMask = slicer.vtkMRMLScalarVolumeNode()
+        inputMovingVolumeMask.SetName('inputMovingVolumeMask')
+        #slicer.mrmlScene.AddNode(inputMovingVolumeMask)
+        self.f_segmentationMask(movingVolumeN4, inputMovingVolumeMask, "cpu", "MRI")
         
-        #self.f_registrationBrainsFit(self)
+        
+        self.f_registrationBrainsFit(inputFixedVolume, inputMovingVolume, outputVolume)
         
         stopTime = time.time()
         logging.info(f'Processing completed in {stopTime-startTime:.2f} seconds')
@@ -708,73 +740,85 @@ class MRICTRegistrationCryoLogic(ScriptedLoadableModuleLogic):
           # success
         return outputVolumeNode
           
-    def f_segmentationMask(self, inputVolumeNode, inputVolumeMask, use_cuda, modality):
-        
-        # Set parameters
-        parameters = {}
-        parameters["inputImageName"] = inputVolumeNode
-        parameters["outputImageName"] = inputVolumeMask
-        
-        #RVXlogic = slicer.util.getModuleLogic('RVXLiverSegmentationEffect')
-        #RVXlogic.launchLiverSegmentation(inputVolumeNode, use_cuda, modality)
-        
-        # Copied this code from class SegmentEditorEffect(AbstractScriptedSegmentEditorEffect): of SlicerRVXLiverSegmentation-main/RVXLiverSegmentationEffect/RVXLiverSegmentationEffectLib
-        
-        masterVolumeNode = slicer.vtkMRMLScalarVolumeNode()
-        #slicer.vtkSlicerSegmentationsModuleLogic.CopyOrientedImageDataToVolumeNode(self.getClippedMasterImageData(), masterVolumeNode)
-        slicer.mrmlScene.AddNode(masterVolumeNode)
-        
+    def f_segmentationMask(self, inputVolumeNode, outputVolumeNode, use_cudaOrCpu, modalityV):
+       
         try:
-            #self.logic.launchLiverSegmentation(masterVolumeNode, use_cuda=self.device.currentText == "cuda", modality=self.modality.currentText)
-            SegmentEditorEffectLogic.launchLiverSegmentation(masterVolumeNode, use_cuda, modality)
-
-            self.scriptedEffect.saveStateForUndo()
-            self.scriptedEffect.modifySelectedSegmentByLabelmap(
-            slicer.vtkSlicerSegmentationsModuleLogic.CreateOrientedImageDataFromVolumeNode(masterVolumeNode),
-            slicer.qSlicerSegmentEditorAbstractEffect.ModificationModeSet)
+            SegmentEditorEffectLogic.launchLiverSegmentation(inputVolumeNode, outputVolumeNode, use_cudaOrCpu, modalityV)
+            
+            #MRICTRegistrationCryoWidget.modifySelectedSegmentByLabelmap(slicer.vtkSlicerSegmentationsModuleLogic.CreateOrientedImageDataFromVolumeNode(masterVolumeNode),slicer.qSlicerSegmentEditorAbstractEffect.ModificationModeSet)
+            
+            # inputVolumeMask needs to be replaced with the converted labelMap that the previous line is doing
 
         except Exception as e:
-            #qt.QApplication.restoreOverrideCursor()
+            qt.QApplication.restoreOverrideCursor()
             slicer.util.errorDisplay(str(e))
 
         finally:
-            #qt.QApplication.restoreOverrideCursor()
-            slicer.mrmlScene.RemoveNode(masterVolumeNode)
-            
-        
-        # Copied this code from class SegmentEditorEffect
-        
-        
-        
+            qt.QApplication.restoreOverrideCursor()
+    
+    
+    #
+    def getClippedMasterImageData(self):
+        """
+        Crops the master volume node if a ROI Node is selected in the parameter comboBox. Otherwise returns the full extent
+        of the volume.
+        """
+        # Return masterImageData unchanged if there is no ROI
+        masterImageData = MRICTRegistrationCryoWidget.advancedFormLayout.masterVolumeImageData()
+        roiNode = self.roiSelector.currentNode()
+        if roiNode is None or masterImageData is None:
+          self.clippedMasterImageData = None
+          self.lastRoiNodeId = ""
+          self.lastRoiNodeModifiedTime = 0
+          return masterImageData
+
+        # Return last clipped image data if there was no change
+        if (
+            self.clippedMasterImageData is not None and roiNode.GetID() == self.lastRoiNodeId and roiNode.GetMTime() == self.lastRoiNodeModifiedTime):
+          # Use cached clipped master image data
+          return self.clippedMasterImageData
+
+        # Compute clipped master image
+        import SegmentEditorLocalThresholdLib
+        self.clippedMasterImageData = SegmentEditorLocalThresholdLib.SegmentEditorEffect.cropOrientedImage(masterImageData,
+                                                                                                           roiNode)
+        self.lastRoiNodeId = roiNode.GetID()
+        self.lastRoiNodeModifiedTime = roiNode.GetMTime()
+        return self.clippedMasterImageData
         
         
           
-    def f_registrationBrainsFit(self, inputFixedVolume, inputMovingVolume):
+    def f_registrationBrainsFit(self, inputFixedVolume, inputMovingVolume, outputVolume):
         
         # Set parameters
         
-        pNode = self.parameterNode()
-        fixedVolumeID = pNode.GetParameter(inputFixedVolume.getID())
-        movingVolumeID = pNode.GetParameter(inputMovingVolume.getID())
-        self.__movingTransform = slicer.vtkMRMLLinearTransformNode()
-        slicer.mrmlScene.AddNode(self.__movingTransform)
-
+        #pNode = self.parameterNode()
+        #fixedVolumeID = pNode.GetParameter(inputFixedVolume.getID())
+        #movingVolumeID = pNode.GetParameter(inputMovingVolume.getID())
+        #self.__movingTransform = slicer.vtkMRMLLinearTransformNode()
+        #slicer.mrmlScene.AddNode(self.__movingTransform)
+        
+        fixedVolumeID = inputFixedVolume.GetID()
+        movingVolumeID = inputMovingVolume.GetID()
+        outputVolumeID = outputVolume.GetID()
+        
         parameters = {}
         parameters["fixedVolume"] = fixedVolumeID
         parameters["movingVolume"] = movingVolumeID
+        parameters["outputVolume"] = outputVolumeID
         parameters["initializeTransformMode"] = "useMomentsAlign"
         parameters["useRigid"] = True
         parameters["useScaleVersor3D"] = True
         parameters["useScaleSkewVersor3D"] = True
         parameters["useAffine"] = True
-        parameters["linearTransform"] = self.__movingTransform.GetID()
+        #parameters["linearTransform"] = self.__movingTransform.GetID()
 
         self.__cliNode = None
-        self.__cliNode = slicer.cli.run(slicer.modules.brainsfit, self.__cliNode, parameters)
+        slicer.cli.run(slicer.modules.brainsfit, self.__cliNode, parameters)
 
-        self.__cliObserverTag = self.__cliNode.AddObserver('ModifiedEvent', self.processRegistrationCompletion)
-        self.__registrationStatus.setText('Wait ...')
-        self.__registrationButton.setEnabled(0)
+        #self.__cliObserverTag = self.__cliNode.AddObserver('ModifiedEvent', self.processRegistrationCompletion)
+        #self.__registrationStatus.setText('Wait ...')
+        #self.__registrationButton.setEnabled(0)
         
         
 
