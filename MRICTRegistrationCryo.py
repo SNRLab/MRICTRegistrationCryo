@@ -600,7 +600,7 @@ class MRICTRegistrationCryoLogic(ScriptedLoadableModuleLogic):
     def f_segmentationMask(self, inputVolumeNode, outputVolumeNode, use_cudaOrCpu, modalityV):
        
         #Have to implement it to have the processing only on the ROI selected
-        slicer.vtkSlicerSegmentationsModuleLogic.CopyOrientedImageDataToVolumeNode(self.getClippedMasterImageData(), inputVolumeNode)
+        #slicer.vtkSlicerSegmentationsModuleLogic.CopyOrientedImageDataToVolumeNode(self.getClippedMasterImageData(), inputVolumeNode)
         
        
         try:
