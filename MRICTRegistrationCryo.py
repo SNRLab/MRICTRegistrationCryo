@@ -1,20 +1,18 @@
 import os
+import os.path
 import unittest
+import gc
 # from matplotlib.pyplot import get
 import vtk, qt, ctk, slicer
 from slicer.ScriptedLoadableModule import *
+from slicer.util import VTKObservationMixin
+import slicer.modules
 from sys import platform
 import logging
 import time
-from slicer.util import VTKObservationMixin
+import numpy as np
+import torch
 
-
-
-
-import gc
-import os.path
-
-from SegmentEditorEffects import *
 import monai
 from monai.inferers.utils import sliding_window_inference
 from monai.networks.layers import Norm
@@ -23,152 +21,7 @@ from monai.transforms import (AddChanneld, Compose, Orientationd, ScaleIntensity
                               Resize, CropForegroundd, ScaleIntensityRange)
 from monai.transforms.compose import MapTransform
 from monai.transforms.post.array import AsDiscrete, KeepLargestConnectedComponent
-import numpy as np
-import qt
-import slicer
-from slicer.ScriptedLoadableModule import *
-import slicer.modules
-from slicer.util import VTKObservationMixin
-import torch
-import vtk
 
-
-class SegmentEditorEffect(AbstractScriptedSegmentEditorEffect):
-  """This effect segments the liver in the input volume using a UNet model"""
-
-  def __init__(self, scriptedEffect):
-    self.device = qt.QComboBox()
-    self.modality = qt.QComboBox()
-    scriptedEffect.name = 'Segment CT/MRI Liver'
-    scriptedEffect.perSegment = True  # this effect operates on a single selected segment
-    AbstractScriptedSegmentEditorEffect.__init__(self, scriptedEffect)
-    self.logic = SegmentEditorEffectLogic()
-    self.clippedMasterImageData = None
-    self.lastRoiNodeId = ""
-    self.lastRoiNodeModifiedTime = 0
-    self.roiSelector = slicer.qMRMLNodeComboBox()
-
-  def clone(self):
-    # It should not be necessary to modify this method
-    import qSlicerSegmentationsEditorEffectsPythonQt as effects
-    clonedEffect = effects.qSlicerSegmentEditorScriptedEffect(None)
-    clonedEffect.setPythonSource(__file__.replace('\\', '/'))
-    return clonedEffect
-
-  def icon(self):
-    # It should not be necessary to modify this method
-    iconPath = os.path.join(os.path.dirname(__file__), 'SegmentEditorEffect.png')
-    if os.path.exists(iconPath):
-      return qt.QIcon(iconPath)
-    return qt.QIcon()
-
-  def helpText(self):
-    return "<html>Segments the liver using a UNet model in CT/MRI modality Volumes<br><br>" \
-           "A ROI may be necessary to limit memory consumption.</html>"
-
-  def setupOptionsFrame(self):
-    """
-    Setup the ROI selection comboBox and the apply segmentation button
-    """
-
-    # CPU / CUDA options
-    self.device.addItems(["cuda", "cpu"])
-    self.scriptedEffect.addLabeledOptionsWidget("Device:", self.device)
-
-    self.modality.addItems(["CT", "MRI"])
-    self.scriptedEffect.addLabeledOptionsWidget("Modality:", self.modality)
-
-    # Add ROI options
-    self.roiSelector.nodeTypes = ['vtkMRMLMarkupsROINode']
-    self.roiSelector.noneEnabled = True
-    self.roiSelector.setMRMLScene(slicer.mrmlScene)
-    self.scriptedEffect.addLabeledOptionsWidget("ROI: ", self.roiSelector)
-
-    # Toggle ROI visibility button
-    toggleROIVisibilityButton = qt.QPushButton("Toggle ROI Visibility")
-    toggleROIVisibilityButton.objectName = self.__class__.__name__ + 'ToggleROIVisibility'
-    toggleROIVisibilityButton.setToolTip("Toggle selected ROI visibility")
-    toggleROIVisibilityButton.connect('clicked()', self.toggleROIVisibility)
-    self.scriptedEffect.addOptionsWidget(toggleROIVisibilityButton)
-
-    # Apply button
-    applyButton = qt.QPushButton("Apply")
-    applyButton.objectName = self.__class__.__name__ + 'Apply'
-    applyButton.setToolTip("Extract liver from input volume")
-    applyButton.connect('clicked()', self.onApply)
-    self.scriptedEffect.addOptionsWidget(applyButton)
-
-  def activate(self):
-    """
-    When activated, disable effect in the view and reset the clipped image data.
-    """
-    self.scriptedEffect.showEffectCursorInSliceView = False
-    self.clippedMasterImageData = None
-
-  def onApply(self):
-    """
-    When applied, crop the input volume if necessary and run the UNet segmentation model on the cropped volume.
-    Overwrites the selected segment labelMap when done.
-    """
-    qt.QApplication.setOverrideCursor(qt.Qt.WaitCursor)
-    masterVolumeNode = slicer.vtkMRMLScalarVolumeNode()
-    slicer.mrmlScene.AddNode(masterVolumeNode)
-    slicer.vtkSlicerSegmentationsModuleLogic.CopyOrientedImageDataToVolumeNode(self.getClippedMasterImageData(),
-                                                                               masterVolumeNode)
-    try:
-      self.logic.launchLiverSegmentation(masterVolumeNode, use_cuda=self.device.currentText == "cuda",
-                                         modality=self.modality.currentText)
-
-      self.scriptedEffect.saveStateForUndo()
-      self.scriptedEffect.modifySelectedSegmentByLabelmap(
-        slicer.vtkSlicerSegmentationsModuleLogic.CreateOrientedImageDataFromVolumeNode(masterVolumeNode),
-        slicer.qSlicerSegmentEditorAbstractEffect.ModificationModeSet)
-
-    except Exception as e:
-      qt.QApplication.restoreOverrideCursor()
-      slicer.util.errorDisplay(str(e))
-
-    finally:
-      qt.QApplication.restoreOverrideCursor()
-      slicer.mrmlScene.RemoveNode(masterVolumeNode)
-
-  def getClippedMasterImageData(self):
-    """
-    Crops the master volume node if a ROI Node is selected in the parameter comboBox. Otherwise returns the full extent
-    of the volume.
-    """
-    # Return masterImageData unchanged if there is no ROI
-    masterImageData = self.scriptedEffect.masterVolumeImageData()
-    roiNode = self.roiSelector.currentNode()
-    if roiNode is None or masterImageData is None:
-      self.clippedMasterImageData = None
-      self.lastRoiNodeId = ""
-      self.lastRoiNodeModifiedTime = 0
-      return masterImageData
-
-    # Return last clipped image data if there was no change
-    if (
-        self.clippedMasterImageData is not None and roiNode.GetID() == self.lastRoiNodeId and roiNode.GetMTime() == self.lastRoiNodeModifiedTime):
-      # Use cached clipped master image data
-      return self.clippedMasterImageData
-
-    # Compute clipped master image
-    import SegmentEditorLocalThresholdLib
-    self.clippedMasterImageData = SegmentEditorLocalThresholdLib.SegmentEditorEffect.cropOrientedImage(masterImageData,
-                                                                                                       roiNode)
-    self.lastRoiNodeId = roiNode.GetID()
-    self.lastRoiNodeModifiedTime = roiNode.GetMTime()
-    return self.clippedMasterImageData
-
-  def toggleROIVisibility(self):
-    """
-    Toggles the visibility of the currently selected ROI.
-    """
-    roiNode = self.roiSelector.currentNode()
-    if roiNode is None:
-      return
-
-    roiNode.SetDisplayVisibility(not roiNode.GetDisplayVisibility())
 
 
 class Normalized(MapTransform):
@@ -213,118 +66,6 @@ class SlicerLoadImage(MapTransform):
     return {self.keys[0]: data, '{}_{}'.format(self.keys[0], self.meta_key_postfix): meta_data}
 
 
-class SegmentEditorEffectLogic(ScriptedLoadableModuleLogic):
-  """
-  Logic class responsible for instantiating the UNet model and running the segmentation on the input node.
-  """
-
-  def __init__(self):
-    ScriptedLoadableModuleLogic.__init__(self)
-
-  @classmethod
-  def createUNetModel(cls, device):
-    return UNet(dimensions=3, in_channels=1, out_channels=2, channels=(16, 32, 64, 128, 256), strides=(2, 2, 2, 2),
-                num_res_units=2, norm=Norm.BATCH, ).to(device)
-
-  @classmethod
-  def getPreprocessingTransform(cls, modality):
-    """
-    Preprocessing transform which converts the input volume to MONAI format and resamples and normalizes its inputs.
-    The values in this transform are the same as in the training transform preprocessing.
-    """
-    if modality == "CT":
-        trans = [SlicerLoadImage(keys=["image"]), AddChanneld(keys=["image"]), Spacingd(keys=["image"], pixdim=(1.5, 1.5, 2.0), mode="bilinear"), Orientationd(keys=["image"], axcodes="RAS"), ScaleIntensityRanged(keys=["image"], a_min=-57, a_max=164, b_min=0.0, b_max=1.0, clip=True), AddChanneld(keys=["image"]), ToTensord(keys=["image"])]
-               
-        return Compose(trans)
-        
-    elif modality == "MRI":
-        trans = [SlicerLoadImage(keys=["image"]), AddChanneld(keys=["image"]), Spacingd(keys=["image"], pixdim=(1.5, 1.5, 2.0), mode="bilinear"), Orientationd(keys=["image"], axcodes="LPS"), Normalized(keys=["image"]), AddChanneld(keys=["image"]), ToTensord(keys=["image"])]
-               
-        return Compose(trans)
-
-  @classmethod
-  def getPostProcessingTransform(cls, original_spacing, original_size, modality):
-    """
-    Simple post processing transform to convert the volume back to its original spacing.
-    """
-    return Compose([
-      AddChanneld(keys=["image"]),
-      Spacingd(keys=["image"], pixdim=original_spacing, mode="nearest"),
-      Resized(keys=["image"], spatial_size=original_size)
-    ])
-
-  @classmethod
-  def launchLiverSegmentation(cls, in_volume_node, out_volume_node, use_cuda, modality):
-    """
-    Runs the segmentation on the input volume and returns the segmentation in the same volume.
-    """
-    device = torch.device("cpu") if not use_cuda or not torch.cuda.is_available() else torch.device("cuda:0")
-    print("Start liver segmentation using device :", device)
-    print(f"Using modality {modality}")
-    try:
-      with torch.no_grad():
-        model_path = os.path.join(os.path.dirname(__file__),
-                                  "liver_ct_model.pt" if modality == "CT" else "liver_mri_model.pt")
-        print("Model path: ", model_path)
-        model = cls.createUNetModel(device=device)
-        model.load_state_dict(torch.load(model_path, map_location=device))
-        print("Model loaded .. ")
-        transform_output = cls.getPreprocessingTransform(modality)(in_volume_node)
-        print("Transform with MONAI applied .. ")
-        model_input = transform_output["image"].to(device)
-
-        print("Run UNet model on input volume")
-
-        roi_size = (160, 160, 160) if modality == "CT" else (240, 240, 96)
-
-        model_output = sliding_window_inference(model_input, roi_size, 4, model, device="cpu", sw_device=device)
-
-        print("Keep largest connected components and threshold UNet output")
-        discrete_output = AsDiscrete(argmax=True)(model_output.reshape(model_output.shape[-4:]))
-        post_processed = KeepLargestConnectedComponent(applied_labels=[1])(discrete_output)
-        output_volume = post_processed.cpu().numpy()[0, :, :, :]
-        
-        print(transform_output["image"])
-        print(transform_output["image"].max())
-        
-        del post_processed, discrete_output, model_output, model, model_input
-
-        transform_output["image"] = output_volume
-        original_spacing = (transform_output["image_meta_dict"]["original_spacing"])
-        original_size = (transform_output["image_meta_dict"]["spacial_shape"])
-        output_inverse_transform = cls.getPostProcessingTransform(original_spacing, original_size, modality)(
-          transform_output)
-
-        label_map_input = output_inverse_transform["image"][0, :, :, :]
-
-        print("output label map shape is " + str(label_map_input.shape))
-
-        output_affine_matrix = transform_output["image_meta_dict"]["affine"]
-
-        out_volume_node.SetIJKToRASMatrix(slicer.util.vtkMatrixFromArray(output_affine_matrix))
-        slicer.util.updateVolumeFromArray(out_volume_node, np.swapaxes(label_map_input, 0, 2))
-        del transform_output
-
-    finally:
-      # Cleanup any remaining memory
-      def del_local(v):
-        if v in locals():
-          del locals()[v]
-
-      for n in ["model_input", "model_output", "post_processed", "model", "transform_output"]:
-        del_local(n)
-
-      gc.collect()
-      torch.cuda.empty_cache()
-
-
-
-
-
-
-
-
-
 class MRICTRegistrationCryo(ScriptedLoadableModule):
     """Uses ScriptedLoadableModule base class, available at:
     https://github.com/Slicer/Slicer/blob/main/Base/Python/slicer/ScriptedLoadableModule.py
@@ -349,11 +90,13 @@ class MRICTRegistrationCryo(ScriptedLoadableModule):
           if os.path.isfile(iconPath):
             parent.icon = qt.QIcon(iconPath)
             break
+            
 
 class MRICTRegistrationCryoWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     """
     """
-
+    enableReloadOnSceneClear = True
+    
     def __init__(self, parent=None):
         
         ScriptedLoadableModuleWidget.__init__(self, parent)
@@ -373,6 +116,59 @@ class MRICTRegistrationCryoWidget(ScriptedLoadableModuleWidget, VTKObservationMi
         self.roiSelector = slicer.qMRMLNodeComboBox()
         
         #Copied from class SegmentEditorEffect(AbstractScriptedSegmentEditorEffect)
+        
+    @staticmethod
+    def areDependenciesSatisfied():
+        from RVXLiverSegmentationEffect import PythonDependencyChecker
+        # Find extra segment editor effects
+        try:
+            import SegmentEditorLocalThresholdLib
+        except ImportError:
+            return False
+
+        return PythonDependencyChecker.areDependenciesSatisfied() and RVXLiverSegmentationLogic.isVmtkFound()
+
+    @staticmethod
+    def downloadDependenciesAndRestart():
+        from RVXLiverSegmentationEffect import PythonDependencyChecker
+        progressDialog = slicer.util.createProgressDialog(maximum=0)
+        extensionManager = slicer.app.extensionsManagerModel()
+
+        def downloadWithMetaData(extName):
+            # Method for downloading extensions prior to Slicer 5.0.3
+            meta_data = extensionManager.retrieveExtensionMetadataByName(extName)
+            if meta_data:
+                return extensionManager.downloadAndInstallExtension(meta_data["extension_id"])
+
+        def downloadWithName(extName):
+            # Direct extension download since Slicer 5.0.3
+            return extensionManager.downloadAndInstallExtensionByName(extName)
+
+        # Install Slicer extensions
+        downloadF = downloadWithName if hasattr(extensionManager,
+                                            "downloadAndInstallExtensionByName") else downloadWithMetaData
+
+        slicerExtensions = ["SlicerVMTK", "MarkupsToModel", "SegmentEditorExtraEffects", "PyTorch"]
+        for slicerExt in slicerExtensions:
+            progressDialog.labelText = f"Installing the {slicerExt}\nSlicer extension"
+            downloadF(slicerExt)
+
+        # Install PIP dependencies
+        PythonDependencyChecker.installDependenciesIfNeeded(progressDialog)
+        progressDialog.close()
+
+        # Restart if no extension failed to download. Otherwise warn the user about the failure.
+        failedDownload = [slicerExt for slicerExt in slicerExtensions if
+                      not extensionManager.isExtensionInstalled(slicerExt)]
+
+        if failedDownload:
+            failed_ext_list = "\n".join(failedDownload)
+            warning_msg = f"The download process failed install the following extensions : {failed_ext_list}" \
+                    f"\n\nPlease try to manually install them using Slicer's extension manager"
+            qt.QMessageBox.warning(None, "Failed to download extensions", warning_msg)
+        else:
+            slicer.app.restart()
+
 
     def setup(self):
         
@@ -503,6 +299,7 @@ class MRICTRegistrationCryoWidget(ScriptedLoadableModuleWidget, VTKObservationMi
         Called when the application closes and the module widget is destroyed.
         """
         self.removeObservers()
+        
         
     def enter(self):
         """
@@ -639,18 +436,11 @@ class MRICTRegistrationCryoWidget(ScriptedLoadableModuleWidget, VTKObservationMi
         self.statusLabel.plainText = ''
         slicer.app.setOverrideCursor(qt.Qt.WaitCursor)
         
-        
-        
         try:
-            # Compute output
-            # with slicer.util.tryWithErrorDisplay("Failed to compute results.", waitCursor=True):
+
             self.logic.process(self.inputFixedVolumeSelector.currentNode(),
                         self.inputMovingVolumeSelector.currentNode(), self.outputVolumeSelector.currentNode())
 
-            # Compute Registration output
-            
-            # The transformed volume after registration is written there
-            # self.logic.process(self.outputVolumeSelector.currentNode())
             time.sleep(3)
             
         except Exception as e:
@@ -700,19 +490,18 @@ class MRICTRegistrationCryoLogic(ScriptedLoadableModuleLogic):
         #Segment the liver from CT using AI based segmentation module RVX
         inputFixedVolumeMask = slicer.vtkMRMLScalarVolumeNode()
         inputFixedVolumeMask.SetName('inputFixedVolumeMask')
-        
         #slicer.mrmlScene.AddNode(inputFixedVolumeMask)
         self.f_segmentationMask(inputFixedVolume, inputFixedVolumeMask, "cpu", "CT")
         
         #Correct bias using N4 filter
         movingVolumeN4 = self.f_n4itkbiasfieldcorrection(inputMovingVolume)
         movingVolumeN4.SetName('movingVolumeN4')
-        #slicer.mrmlScene.AddNode(movingVolumeN4)
+        slicer.mrmlScene.AddNode(movingVolumeN4)
         
         #Segment the liver from MRI using AI based segmentation module RVX
         inputMovingVolumeMask = slicer.vtkMRMLScalarVolumeNode()
         inputMovingVolumeMask.SetName('inputMovingVolumeMask')
-        #slicer.mrmlScene.AddNode(inputMovingVolumeMask)
+        slicer.mrmlScene.AddNode(inputMovingVolumeMask)
         self.f_segmentationMask(movingVolumeN4, inputMovingVolumeMask, "cpu", "MRI")
         
         
@@ -743,11 +532,7 @@ class MRICTRegistrationCryoLogic(ScriptedLoadableModuleLogic):
     def f_segmentationMask(self, inputVolumeNode, outputVolumeNode, use_cudaOrCpu, modalityV):
        
         try:
-            SegmentEditorEffectLogic.launchLiverSegmentation(inputVolumeNode, outputVolumeNode, use_cudaOrCpu, modalityV)
-            
-            #MRICTRegistrationCryoWidget.modifySelectedSegmentByLabelmap(slicer.vtkSlicerSegmentationsModuleLogic.CreateOrientedImageDataFromVolumeNode(masterVolumeNode),slicer.qSlicerSegmentEditorAbstractEffect.ModificationModeSet)
-            
-            # inputVolumeMask needs to be replaced with the converted labelMap that the previous line is doing
+            self.launchLiverSegmentation(inputVolumeNode, outputVolumeNode, use_cudaOrCpu, modalityV)
 
         except Exception as e:
             qt.QApplication.restoreOverrideCursor()
@@ -792,12 +577,6 @@ class MRICTRegistrationCryoLogic(ScriptedLoadableModuleLogic):
         
         # Set parameters
         
-        #pNode = self.parameterNode()
-        #fixedVolumeID = pNode.GetParameter(inputFixedVolume.getID())
-        #movingVolumeID = pNode.GetParameter(inputMovingVolume.getID())
-        #self.__movingTransform = slicer.vtkMRMLLinearTransformNode()
-        #slicer.mrmlScene.AddNode(self.__movingTransform)
-        
         fixedVolumeID = inputFixedVolume.GetID()
         movingVolumeID = inputMovingVolume.GetID()
         outputVolumeID = outputVolume.GetID()
@@ -821,6 +600,107 @@ class MRICTRegistrationCryoLogic(ScriptedLoadableModuleLogic):
         #self.__registrationButton.setEnabled(0)
         
         
+    @classmethod
+    def createUNetModel(cls, device):
+        return UNet(dimensions=3, in_channels=1, out_channels=2, channels=(16, 32, 64, 128, 256), strides=(2, 2, 2, 2),
+                    num_res_units=2, norm=Norm.BATCH, ).to(device)
+
+    @classmethod
+    def getPreprocessingTransform(cls, modality):
+        """
+        Preprocessing transform which converts the input volume to MONAI format and resamples and normalizes its inputs.
+        The values in this transform are the same as in the training transform preprocessing.
+        """
+        if modality == "CT":
+            trans = [SlicerLoadImage(keys=["image"]), AddChanneld(keys=["image"]), Spacingd(keys=["image"], pixdim=(1.5, 1.5, 2.0), mode="bilinear"), Orientationd(keys=["image"], axcodes="RAS"), ScaleIntensityRanged(keys=["image"], a_min=-57, a_max=164, b_min=0.0, b_max=1.0, clip=True), AddChanneld(keys=["image"]), ToTensord(keys=["image"])]
+                   
+            return Compose(trans)
+            
+        elif modality == "MRI":
+            trans = [SlicerLoadImage(keys=["image"]), AddChanneld(keys=["image"]), Spacingd(keys=["image"], pixdim=(1.5, 1.5, 2.0), mode="bilinear"), Orientationd(keys=["image"], axcodes="LPS"), Normalized(keys=["image"]), AddChanneld(keys=["image"]), ToTensord(keys=["image"])]
+                   
+            return Compose(trans)
+
+    @classmethod
+    def getPostProcessingTransform(cls, original_spacing, original_size, modality):
+        """
+        Simple post processing transform to convert the volume back to its original spacing.
+        """
+        return Compose([
+            AddChanneld(keys=["image"]),
+            Spacingd(keys=["image"], pixdim=original_spacing, mode="nearest"),
+            Resized(keys=["image"], spatial_size=original_size)
+        ])
+
+    @classmethod
+    def launchLiverSegmentation(cls, in_volume_node, out_volume_node, use_cuda, modality):
+        """
+        Runs the segmentation on the input volume and returns the segmentation in the same volume.
+        """
+        device = torch.device("cpu") if not use_cuda or not torch.cuda.is_available() else torch.device("cuda:0")
+        print("Start liver segmentation using device :", device)
+        print(f"Using modality {modality}")
+        try:
+          with torch.no_grad():
+            model_path = os.path.join(os.path.dirname(__file__),
+                                      "liver_ct_model.pt" if modality == "CT" else "liver_mri_model.pt")
+            print("Model path: ", model_path)
+            model = cls.createUNetModel(device=device)
+            model.load_state_dict(torch.load(model_path, map_location=device))
+            print("Model loaded .. ")
+            transform_output = cls.getPreprocessingTransform(modality)(in_volume_node)
+            print("Transform with MONAI applied .. ")
+            model_input = transform_output["image"].to(device)
+
+            print("Run UNet model on input volume")
+
+            roi_size = (160, 160, 160) if modality == "CT" else (240, 240, 96)
+
+            model_output = sliding_window_inference(model_input, roi_size, 4, model, device="cpu", sw_device=device)
+
+            print("Keep largest connected components and threshold UNet output")
+            discrete_output = AsDiscrete(argmax=True)(model_output.reshape(model_output.shape[-4:]))
+            post_processed = KeepLargestConnectedComponent(applied_labels=[1])(discrete_output)
+            output_volume = post_processed.cpu().numpy()[0, :, :, :]
+            
+            print(transform_output["image"])
+            print(transform_output["image"].max())
+            
+            del post_processed, discrete_output, model_output, model, model_input
+
+            transform_output["image"] = output_volume
+            original_spacing = (transform_output["image_meta_dict"]["original_spacing"])
+            original_size = (transform_output["image_meta_dict"]["spacial_shape"])
+            output_inverse_transform = cls.getPostProcessingTransform(original_spacing, original_size, modality)(
+              transform_output)
+
+            label_map_input = output_inverse_transform["image"][0, :, :, :]
+
+            print("output label map shape is " + str(label_map_input.shape))
+
+            output_affine_matrix = transform_output["image_meta_dict"]["affine"]
+
+            out_volume_node.SetIJKToRASMatrix(slicer.util.vtkMatrixFromArray(output_affine_matrix))
+            slicer.util.updateVolumeFromArray(out_volume_node, np.swapaxes(label_map_input, 0, 2))
+            del transform_output
+
+        finally:
+            # Cleanup any remaining memory
+            def del_local(v):
+                if v in locals():
+                    del locals()[v]
+
+            for n in ["model_input", "model_output", "post_processed", "model", "transform_output"]:
+                del_local(n)
+
+            gc.collect()
+            torch.cuda.empty_cache()
+          
+      
+      
+      
+      
+      
 
 class MRICTRegistrationCryoTest(ScriptedLoadableModuleTest):
     """
