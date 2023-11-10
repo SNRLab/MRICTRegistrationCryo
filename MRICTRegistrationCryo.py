@@ -66,6 +66,51 @@ class SlicerLoadImage(MapTransform):
     return {self.keys[0]: data, '{}_{}'.format(self.keys[0], self.meta_key_postfix): meta_data}
 
 
+
+
+
+class PythonDependencyChecker(object):
+  """
+  Class responsible for installing the Modules dependencies
+  """
+
+  @classmethod
+  def areDependenciesSatisfied(cls):
+    try:
+      from packaging import version
+      import monai
+      import itk
+      import torch
+      import skimage
+      import gdown
+      import nibabel
+
+      # Make sure MONAI version is compatible with package
+      return version.parse("0.6.0") < version.parse(monai.__version__) <= version.parse("0.9.0")
+    except ImportError:
+      return False
+
+  @classmethod
+  def installDependenciesIfNeeded(cls, progressDialog=None):
+    if cls.areDependenciesSatisfied():
+      return
+
+    progressDialog = progressDialog or slicer.util.createProgressDialog(maximum=0)
+    progressDialog.labelText = "Installing PyTorch"
+
+    try:
+      # Try to install the best available pytorch version for the environment using the PyTorch Slicer extension
+      import PyTorchUtils
+      PyTorchUtils.PyTorchUtilsLogic().installTorch()
+    except ImportError:
+      # Fallback on default torch available on PIP
+      slicer.util.pip_install("torch")
+
+    for dep in ["itk", "nibabel", "scikit-image", "gdown", "monai>0.6.0,<=0.9.0"]:
+      progressDialog.labelText = dep
+      slicer.util.pip_install(dep)
+
+
 class MRICTRegistrationCryo(ScriptedLoadableModule):
     """Uses ScriptedLoadableModule base class, available at:
     https://github.com/Slicer/Slicer/blob/main/Base/Python/slicer/ScriptedLoadableModule.py
@@ -106,8 +151,6 @@ class MRICTRegistrationCryoWidget(ScriptedLoadableModuleWidget, VTKObservationMi
         self._parameterNode = None
         self._updatingGUIFromParameterNode = False
         
-        #Copied from class SegmentEditorEffect(AbstractScriptedSegmentEditorEffect):
-        
         self.device = None
         self.modality = None
         self.clippedMasterImageData = None
@@ -115,22 +158,21 @@ class MRICTRegistrationCryoWidget(ScriptedLoadableModuleWidget, VTKObservationMi
         self.lastRoiNodeModifiedTime = 0
         self.roiSelector = slicer.qMRMLNodeComboBox()
         
-        #Copied from class SegmentEditorEffect(AbstractScriptedSegmentEditorEffect)
         
     @staticmethod
     def areDependenciesSatisfied():
-        from RVXLiverSegmentationEffect import PythonDependencyChecker
+        #from RVXLiverSegmentationEffect import PythonDependencyChecker
         # Find extra segment editor effects
         try:
             import SegmentEditorLocalThresholdLib
         except ImportError:
             return False
 
-        return PythonDependencyChecker.areDependenciesSatisfied() and RVXLiverSegmentationLogic.isVmtkFound()
+        return PythonDependencyChecker.areDependenciesSatisfied()
 
     @staticmethod
     def downloadDependenciesAndRestart():
-        from RVXLiverSegmentationEffect import PythonDependencyChecker
+        #from RVXLiverSegmentationEffect import PythonDependencyChecker
         progressDialog = slicer.util.createProgressDialog(maximum=0)
         extensionManager = slicer.app.extensionsManagerModel()
 
@@ -179,6 +221,32 @@ class MRICTRegistrationCryoWidget(ScriptedLoadableModuleWidget, VTKObservationMi
         # These connections ensure that we update parameter node when scene is closed
         self.addObserver(slicer.mrmlScene, slicer.mrmlScene.StartCloseEvent, self.onSceneStartClose)
         self.addObserver(slicer.mrmlScene, slicer.mrmlScene.EndCloseEvent, self.onSceneEndClose)
+        
+        
+        
+        
+        # Verify Slicer version compatibility
+        if not (slicer.app.majorVersion, slicer.app.minorVersion, float(slicer.app.revision)) >= (4, 11, 29738):
+          error_msg = "The RVesselX plugin is only compatible from Slicer 4.11 2021.02.26 onwards.\n" \
+                      "Please download the latest Slicer version to use this plugin."
+          self.layout.addWidget(qt.QLabel(error_msg))
+          self.layout.addStretch()
+          slicer.util.errorDisplay(error_msg)
+          return
+
+        if not self.areDependenciesSatisfied():
+          error_msg = "Slicer VMTK, MarkupsToModel, SegmentEditorExtraEffects and MONAI are required by this plugin.\n" \
+                      "Please click on the Download button to download and install these dependencies."
+          self.layout.addWidget(qt.QLabel(error_msg))
+          downloadDependenciesButton = createButton("Download dependencies and restart",
+                                                    self.downloadDependenciesAndRestart)
+          self.layout.addWidget(downloadDependenciesButton)
+          self.layout.addStretch()
+          return
+        
+        
+        
+        
 
         # IO collapsible button
         IOCategory = qt.QWidget()
@@ -530,6 +598,10 @@ class MRICTRegistrationCryoLogic(ScriptedLoadableModuleLogic):
         return outputVolumeNode
           
     def f_segmentationMask(self, inputVolumeNode, outputVolumeNode, use_cudaOrCpu, modalityV):
+       
+        #Have to implement it to have the processing only on the ROI selected
+        slicer.vtkSlicerSegmentationsModuleLogic.CopyOrientedImageDataToVolumeNode(self.getClippedMasterImageData(), inputVolumeNode)
+        
        
         try:
             self.launchLiverSegmentation(inputVolumeNode, outputVolumeNode, use_cudaOrCpu, modalityV)
