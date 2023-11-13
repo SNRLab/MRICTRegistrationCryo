@@ -558,7 +558,7 @@ class MRICTRegistrationCryoLogic(ScriptedLoadableModuleLogic):
         #Segment the liver from CT using AI based segmentation module RVX
         inputFixedVolumeMask = slicer.vtkMRMLScalarVolumeNode()
         inputFixedVolumeMask.SetName('inputFixedVolumeMask')
-        #slicer.mrmlScene.AddNode(inputFixedVolumeMask)
+        slicer.mrmlScene.AddNode(inputFixedVolumeMask)
         self.f_segmentationMask(inputFixedVolume, inputFixedVolumeMask, "cpu", "CT")
         
         #Correct bias using N4 filter
@@ -572,8 +572,8 @@ class MRICTRegistrationCryoLogic(ScriptedLoadableModuleLogic):
         slicer.mrmlScene.AddNode(inputMovingVolumeMask)
         self.f_segmentationMask(movingVolumeN4, inputMovingVolumeMask, "cpu", "MRI")
         
-        
-        self.f_registrationBrainsFit(inputFixedVolume, inputMovingVolume, outputVolume)
+        maskProcessingMode = "ROI" #Specifies a mask to only consider a certain image region for the registration.  If ROIAUTO is chosen, then the mask is computed using Otsu thresholding and hole filling. If ROI is chosen then the mask has to be specified as in input.
+        self.f_registrationBrainsFit(inputFixedVolume, inputMovingVolume, outputVolume, maskProcessingMode, inputFixedVolumeMask, inputMovingVolumeMask)
         
         stopTime = time.time()
         logging.info(f'Processing completed in {stopTime-startTime:.2f} seconds')
@@ -645,23 +645,29 @@ class MRICTRegistrationCryoLogic(ScriptedLoadableModuleLogic):
         
         
           
-    def f_registrationBrainsFit(self, inputFixedVolume, inputMovingVolume, outputVolume):
+    def f_registrationBrainsFit(self, inputFixedVolume, inputMovingVolume, outputVolume, maskProcessingMode, fixedBinaryVolume, movingBinaryVolume):
         
         # Set parameters
         
         fixedVolumeID = inputFixedVolume.GetID()
         movingVolumeID = inputMovingVolume.GetID()
         outputVolumeID = outputVolume.GetID()
-        
+        fixedBinaryVolumeID = fixedBinaryVolume.GetID()
+        movingBinaryVolumeID = movingBinaryVolume.GetID()
+                
         parameters = {}
         parameters["fixedVolume"] = fixedVolumeID
         parameters["movingVolume"] = movingVolumeID
         parameters["outputVolume"] = outputVolumeID
+        parameters["maskProcessingMode"] = maskProcessingMode
+        parameters["fixedBinaryVolume"] = fixedBinaryVolumeID
+        parameters["movingBinaryVolume"] = movingBinaryVolumeID
         parameters["initializeTransformMode"] = "useMomentsAlign"
         parameters["useRigid"] = True
         parameters["useScaleVersor3D"] = True
         parameters["useScaleSkewVersor3D"] = True
         parameters["useAffine"] = True
+        parameters["useBSpline"] = True
         #parameters["linearTransform"] = self.__movingTransform.GetID()
 
         self.__cliNode = None
