@@ -55,6 +55,10 @@ from monai.transforms import (AddChanneld, Compose, Orientationd, ScaleIntensity
 from monai.transforms.compose import MapTransform
 from monai.transforms.post.array import AsDiscrete, KeepLargestConnectedComponent
 
+# Logging is not working. Where to define this logging?
+#logfilename = os.path.join(os.path.dirname(self.parent.path),"logfile.txt")
+logging.basicConfig(filename="logfile.txt", encoding='utf-8', filemode='w', level=logging.DEBUG, format="%(name)s → %(levelname)s: %(message)s")
+
 
 class Normalized(MapTransform):
   """
@@ -254,7 +258,7 @@ class MRICTRegistrationCryo(ScriptedLoadableModule):
             if os.path.isfile(iconPath):
                 parent.icon = qt.QIcon(iconPath) # Set module icon
                 break # Use the first valid icon found
-            
+        
 
 class MRICTRegistrationCryoWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     """
@@ -763,21 +767,26 @@ class MRICTRegistrationCryoWidget(ScriptedLoadableModuleWidget, VTKObservationMi
         slicer.app.processEvents()  # force update of the application events
 
 
-class MRICTRegistrationCryoLogic(ScriptedLoadableModuleLogic):
+class MRICTRegistrationCryoLogic(ScriptedLoadableModuleLogic, unittest.TestCase):
     """
     Handles the logic for MRI-CT registration within the CryoAblation module.
     
     This class encapsulates the main processing logic for MRI-CT registration. It includes methods
     for setting default parameters, performing image processing steps like bias field correction
-    and segmentation, as well as running registration algorithms. Additionally, it implements
-    functions for creating and utilizing UNet models for liver segmentation.
+    and segmentation, as well as running registration algorithms. Bias correction functions uses
+    Slicer 3D module N4ITKBiasFieldCorrection described at
+    http://viewvc.slicer.org/viewcvs.cgi/trunk/Applications/CLI/N4ITKBiasFieldCorrection. Additionally,
+    it implements functions for creating and utilizing UNet models for liver segmentation based on the selected
+    modality using Slicer 3D module R-Vessel-X described at https://github.com/R-Vessel-X/SlicerRVXLiverSegmentation.
+    The registration functions are based on Slicer 3D module BrainsFit described at
+    https://github.com/BRAINSia/BRAINSTools/tree/main/BRAINSFit
     
     Key Methods:
     - setDefaultParameters: Sets default parameters for processing.
     - process: Executes the processing algorithm for registration.
     - f_n4itkbiasfieldcorrection: Performs bias field correction using the N4 ITK module.
-    - f_segmentationMask: Segments the liver using AI-based segmentation based on the selected modality.
-    - f_registrationBrainsFit2 & f_registrationBrainsFit: Perform registration using BrainsFit algorithm with or without masks.
+    - f_segmentationMask: Segments the liver using AI-based segmentation
+    - f_registrationBrainsFit: Perform registration with or without masks
     - createUNetModel: Creates a UNet model based on the selected device.
     - getPreprocessingTransform & getPostProcessingTransform: Handles pre-processing and post-processing transformations.
     - launchLiverSegmentation: Initiates liver segmentation using a UNet model.
@@ -825,8 +834,7 @@ class MRICTRegistrationCryoLogic(ScriptedLoadableModuleLogic):
         
         maskProcessingMode = "NOMASK" #Specifies a mask to only consider a certain image region for the registration.  If ROIAUTO is chosen, then the mask is computed using Otsu thresholding and hole filling. If ROI is chosen then the mask has to be specified as in input.
         self.f_registrationBrainsFit(inputFixedVolume, inputMovingVolume, outputVolume, maskProcessingMode, inputFixedVolumeMask, inputMovingVolumeMask)
-        # Just for testing without passing the masks
-        #self.f_registrationBrainsFit2(inputFixedVolume, inputMovingVolume, outputVolume)
+
         print("returned to Process")
         
         stopTime = time.time()
@@ -835,10 +843,8 @@ class MRICTRegistrationCryoLogic(ScriptedLoadableModuleLogic):
     def f_n4itkbiasfieldcorrection(self, inputVolumeNode):
         """
         Performs bias field correction using the N4 ITK module.
-        
         Args:
         - inputVolumeNode: Input volume node to perform bias field correction.
-
         Returns:
         - outputVolumeNode: Output volume node after bias field correction.
         """
@@ -917,41 +923,10 @@ class MRICTRegistrationCryoLogic(ScriptedLoadableModuleLogic):
         self.lastRoiNodeModifiedTime = roiNode.GetMTime()
         return self.clippedMasterImageData
         
-    def f_registrationBrainsFit2(self, inputFixedVolume, inputMovingVolume, outputVolume):
-        
-        """
-        Perform registration using BrainsFit without masking. This function is written just to test f_registrationBrainsFit()
-        """
-        fixedVolumeID = inputFixedVolume.GetID()
-        movingVolumeID = inputMovingVolume.GetID()
-        outputVolumeID = outputVolume.GetID()
-                
-        parameters = {
-            "fixedVolume": fixedVolumeID,
-            "movingVolume": movingVolumeID,
-            "outputVolume": outputVolumeID,
-            "initializeTransformMode": "useMomentsAlign",
-            "useRigid": True,
-            "useScaleVersor3D": True,
-            "useScaleSkewVersor3D": True,
-            "useAffine": True,
-            "useBSpline": True,
-            #"linearTransform": self.__movingTransform.GetID()
-        }
-        
-        print("Calling slicer.modules.brainsfit")
-        self.__cliNode = None
-        slicer.cli.run(slicer.modules.brainsfit, self.__cliNode, parameters)
-        print("slicer.modules.brainsfit completed")
-
-        #self.__cliObserverTag = self.__cliNode.AddObserver('ModifiedEvent', self.processRegistrationCompletion)
-        #self.__registrationStatus.setText('Wait ...')
-        #self.__registrationButton.setEnabled(0)
-    
     
     def f_registrationBrainsFit(self, inputFixedVolume, inputMovingVolume, outputVolume, maskProcessingMode, fixedBinaryVolume, movingBinaryVolume):
         """
-        Perform registration using BrainsFit with masks.
+        Perform registration using BrainsFit
         """
         # Set parameters
         fixedVolumeID = inputFixedVolume.GetID()
@@ -978,9 +953,8 @@ class MRICTRegistrationCryoLogic(ScriptedLoadableModuleLogic):
 
         print("Calling slicer.modules.brainsfit")
         self.__cliNode = None
-        slicer.cli.run(slicer.modules.brainsfit, self.__cliNode, parameters)
-        print("slicer.modules.brainsfit completed")
-
+        slicer.cli.runSync(slicer.modules.brainsfit, self.__cliNode, parameters)
+        
         #self.__cliObserverTag = self.__cliNode.AddObserver('ModifiedEvent', self.processRegistrationCompletion)
         #self.__registrationStatus.setText('Wait ...')
         #self.__registrationButton.setEnabled(0)
