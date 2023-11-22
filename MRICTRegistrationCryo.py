@@ -293,6 +293,10 @@ class MRICTRegistrationCryoWidget(ScriptedLoadableModuleWidget, VTKObservationMi
         # Initialization of the widget
         ScriptedLoadableModuleWidget.__init__(self, parent)
         VTKObservationMixin.__init__(self)  # Needed for parameter node observation
+        self.addObserver(slicer.mrmlScene, None, None)
+        self.logic = None
+        self._parameterNode = None
+        self._updatingGUIFromParameterNode = False
         
         # Widget attributes initialization
         self.addObserver(slicer.mrmlScene, None, None)
@@ -725,9 +729,9 @@ class MRICTRegistrationCryoWidget(ScriptedLoadableModuleWidget, VTKObservationMi
             self.registrationInProgress = False
             self.abortRequested = True
             raise ValueError("User requested cancel.")
-            #self.cliNode.Cancel() # not implemented
+            self.cliNode.Cancel() # not implemented
             self.applyButton.text = "Cancelling..."
-            self.applyButton.enabled = True   #Should be False but changed to True for testing
+            self.applyButton.enabled = False   #Should be False but changed to True for testing
             return
 
         self.registrationInProgress = True
@@ -822,9 +826,10 @@ class MRICTRegistrationCryoLogic(ScriptedLoadableModuleLogic, unittest.TestCase)
         self.f_segmentationMask(inputFixedVolume, inputFixedVolumeMask, "cpu", "CT")
         
         #Correct bias using N4 filter
-        movingVolumeN4 = self.f_n4itkbiasfieldcorrection(inputMovingVolume)
+        movingVolumeN4 = slicer.vtkMRMLScalarVolumeNode()
         movingVolumeN4.SetName('movingVolumeN4')
         slicer.mrmlScene.AddNode(movingVolumeN4)
+        self.f_n4itkbiasfieldcorrection(inputMovingVolume, movingVolumeN4)
         
         #Segment the liver from MRI using AI based segmentation module RVX
         inputMovingVolumeMask = slicer.vtkMRMLScalarVolumeNode()
@@ -832,7 +837,7 @@ class MRICTRegistrationCryoLogic(ScriptedLoadableModuleLogic, unittest.TestCase)
         slicer.mrmlScene.AddNode(inputMovingVolumeMask)
         self.f_segmentationMask(movingVolumeN4, inputMovingVolumeMask, "cpu", "MRI")
         
-        maskProcessingMode = "NOMASK" #Specifies a mask to only consider a certain image region for the registration.  If ROIAUTO is chosen, then the mask is computed using Otsu thresholding and hole filling. If ROI is chosen then the mask has to be specified as in input.
+        maskProcessingMode = "ROI" #Specifies a mask to only consider a certain image region for the registration.  If ROIAUTO is chosen, then the mask is computed using Otsu thresholding and hole filling. If ROI is chosen then the mask has to be specified as in input.
         self.f_registrationBrainsFit(inputFixedVolume, inputMovingVolume, outputVolume, maskProcessingMode, inputFixedVolumeMask, inputMovingVolumeMask)
 
         print("returned to Process")
@@ -840,7 +845,7 @@ class MRICTRegistrationCryoLogic(ScriptedLoadableModuleLogic, unittest.TestCase)
         stopTime = time.time()
         logging.info(f'Processing completed in {stopTime-startTime:.2f} seconds')
     
-    def f_n4itkbiasfieldcorrection(self, inputVolumeNode):
+    def f_n4itkbiasfieldcorrection(self, inputVolumeNode, outputVolNode):
         """
         Performs bias field correction using the N4 ITK module.
         Args:
@@ -852,7 +857,7 @@ class MRICTRegistrationCryoLogic(ScriptedLoadableModuleLogic, unittest.TestCase)
         # Set parameters for the N4 ITK bias field correction
         parameters = {
             "inputImageName": inputVolumeNode,
-            "outputImageName": slicer.mrmlScene.AddNewNodeByClass("vtkMRMLScalarVolumeNode")
+            "outputImageName": outputVolNode
         }
         
         # Run the N4 ITK bias field correction CLI
@@ -863,11 +868,11 @@ class MRICTRegistrationCryoLogic(ScriptedLoadableModuleLogic, unittest.TestCase)
         if cliNode.GetStatus() & cliNode.ErrorsMask:
             # error occurred during CLI executio
             errorText = cliNode.GetErrorText()
-            slicer.mrmlScene.RemoveNode(cliNode)
+            #slicer.mrmlScene.RemoveNode(cliNode)
             raise ValueError("CLI execution failed: " + errorText)
         
         # Return the output volume node after bias field correction
-        return parameters["outputImageName"]
+        #return parameters["outputImageName"]
     
     
     def f_segmentationMask(self, inputVolumeNode, outputVolumeNode, use_cudaOrCpu, modalityV):
@@ -881,8 +886,6 @@ class MRICTRegistrationCryoLogic(ScriptedLoadableModuleLogic, unittest.TestCase)
         - modalityV: Modality type for segmentation ('CT' or 'MRI').
         """
         
-        #Have to implement it to have the processing only on the ROI selected
-        #slicer.vtkSlicerSegmentationsModuleLogic.CopyOrientedImageDataToVolumeNode(self.getClippedMasterImageData(), inputVolumeNode)
         try:
             self.launchLiverSegmentation(inputVolumeNode, outputVolumeNode, use_cudaOrCpu, modalityV)
 
@@ -893,35 +896,6 @@ class MRICTRegistrationCryoLogic(ScriptedLoadableModuleLogic, unittest.TestCase)
         finally:
             qt.QApplication.restoreOverrideCursor()
     
-  
-    def getClippedMasterImageData(self):
-        """
-        Crops the master volume node if a ROI Node is selected in the parameter comboBox. Otherwise returns the full extent of the volume.
-        """
-        # Return masterImageData unchanged if there is no ROI
-        masterImageData = MRICTRegistrationCryoWidget.advancedFormLayout.masterVolumeImageData()
-        roiNode = self.roiSelector.currentNode()
-        if roiNode is None or masterImageData is None:
-            self.clippedMasterImageData = None
-            self.lastRoiNodeId = ""
-            self.lastRoiNodeModifiedTime = 0
-            return masterImageData
-
-        # Compute clipped master image. Return last clipped image data if there was no change
-        if (self.clippedMasterImageData is not None and
-                roiNode.GetID() == self.lastRoiNodeId and
-                roiNode.GetMTime() == self.lastRoiNodeModifiedTime):
-          
-            # Use cached clipped master image data
-            return self.clippedMasterImageData
-
-        # Compute clipped master image using the SegmentEditorLocalThresholdLib
-        import SegmentEditorLocalThresholdLib
-        self.clippedMasterImageData = SegmentEditorLocalThresholdLib.SegmentEditorEffect.cropOrientedImage(masterImageData, roiNode)
-        
-        self.lastRoiNodeId = roiNode.GetID()
-        self.lastRoiNodeModifiedTime = roiNode.GetMTime()
-        return self.clippedMasterImageData
         
     
     def f_registrationBrainsFit(self, inputFixedVolume, inputMovingVolume, outputVolume, maskProcessingMode, fixedBinaryVolume, movingBinaryVolume):
@@ -934,6 +908,9 @@ class MRICTRegistrationCryoLogic(ScriptedLoadableModuleLogic, unittest.TestCase)
         outputVolumeID = outputVolume.GetID()
         fixedBinaryVolumeID = fixedBinaryVolume.GetID()
         movingBinaryVolumeID = movingBinaryVolume.GetID()
+        
+        self.__movingTransform = slicer.vtkMRMLBSplineTransformNode()
+        slicer.mrmlScene.AddNode(self.__movingTransform)
                 
         parameters = {
             "fixedVolume": fixedVolumeID,
@@ -943,21 +920,22 @@ class MRICTRegistrationCryoLogic(ScriptedLoadableModuleLogic, unittest.TestCase)
             "fixedBinaryVolume": fixedBinaryVolumeID,
             "movingBinaryVolume": movingBinaryVolumeID,
             "initializeTransformMode": "useMomentsAlign",
+            #"useAlignGeometryAlign", "useCenterOfROIAlign", "useMomentsAlign"
             "useRigid": True,
             "useScaleVersor3D": True,
             "useScaleSkewVersor3D": True,
             "useAffine": True,
             "useBSpline": True,
-            #"linearTransform" = self.__movingTransform.GetID()
+            "BSplineTransform": self.__movingTransform.GetID()
         }
 
         print("Calling slicer.modules.brainsfit")
+        
         self.__cliNode = None
-        slicer.cli.runSync(slicer.modules.brainsfit, self.__cliNode, parameters)
+        cliNode = slicer.cli.runSync(slicer.modules.brainsfit, self.__cliNode, parameters)
         
         #self.__cliObserverTag = self.__cliNode.AddObserver('ModifiedEvent', self.processRegistrationCompletion)
-        #self.__registrationStatus.setText('Wait ...')
-        #self.__registrationButton.setEnabled(0)
+        
     
     @classmethod
     def createUNetModel(cls, device):
