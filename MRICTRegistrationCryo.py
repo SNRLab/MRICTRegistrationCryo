@@ -828,18 +828,22 @@ class MRICTRegistrationCryoLogic(ScriptedLoadableModuleLogic, unittest.TestCase)
         
         # Segment the liver from CT using AI based segmentation module RVX
         inputFixedVolumeMask = slicer.vtkMRMLScalarVolumeNode()
+        #Trying changing the type of node for mask
+        #inputFixedVolumeMask = slicer.vtkMRMLSegmentationNode()
         inputFixedVolumeMask.SetName('inputFixedVolumeMask')
         slicer.mrmlScene.AddNode(inputFixedVolumeMask)
         self.f_segmentationMask(inputFixedVolume, inputFixedVolumeMask, "cpu", "CT")
         
-        #Correct bias using N4 filter
+        #Correct bias using N4 filter #We don't need this step before segmentation. But at this point the segmentation algorithm is not working without the bias correction. It seems it is because of the data type of MRI volume which is "unsigned short" whereas the after correction it is int
         movingVolumeN4 = slicer.vtkMRMLScalarVolumeNode()
         movingVolumeN4.SetName('movingVolumeN4')
         slicer.mrmlScene.AddNode(movingVolumeN4)
-        self.f_n4itkbiasfieldcorrection(inputMovingVolume, movingVolumeN4)
+        self.f_n4itkbiasfieldcorrection(inputMovingVolume, movingVolumeN4, None, [1,1,1])
         
         #Segment the liver from MRI using AI based segmentation module RVX
         inputMovingVolumeMask = slicer.vtkMRMLScalarVolumeNode()
+        #Trying changing the type of node for mask
+        #inputMovingVolumeMask = slicer.vtkMRMLSegmentationNode()
         inputMovingVolumeMask.SetName('inputMovingVolumeMask')
         slicer.mrmlScene.AddNode(inputMovingVolumeMask)
         self.f_segmentationMask(movingVolumeN4, inputMovingVolumeMask, "cpu", "MRI")
@@ -847,14 +851,19 @@ class MRICTRegistrationCryoLogic(ScriptedLoadableModuleLogic, unittest.TestCase)
         #inputFixedVolume = self.removeBedFromCT(inputFixedVolume, roiCT)
         
         maskProcessingMode = "ROI" #Specifies a mask to only consider a certain image region for the registration.  If ROIAUTO is chosen, then the mask is computed using Otsu thresholding and hole filling. If ROI is chosen then the mask has to be specified as in input.
+        
+        #With mask the code is working worse than without mask.
         self.f_registrationBrainsFit(inputFixedVolume, movingVolumeN4, outputVolume, maskProcessingMode, inputFixedVolumeMask, inputMovingVolumeMask)
-
+        
+        # Without the masks the code is working better though the registration result is not perfect
+        #self.f_registrationBrainsFit2(inputFixedVolume, movingVolumeN4, outputVolume)
+        
         print("returned to Process")
         
         stopTime = time.time()
         logging.info(f'Processing completed in {stopTime-startTime:.2f} seconds')
     
-    def f_n4itkbiasfieldcorrection(self, inputVolumeNode, outputVolNode):
+    def f_n4itkbiasfieldcorrection(self, inputVolumeNode, outputVolNode, inputMask, initMeshResolution):
         """
         Performs bias field correction using the N4 ITK module.
         Args:
@@ -866,7 +875,9 @@ class MRICTRegistrationCryoLogic(ScriptedLoadableModuleLogic, unittest.TestCase)
         # Set parameters for the N4 ITK bias field correction
         parameters = {
             "inputImageName": inputVolumeNode,
-            "outputImageName": outputVolNode
+            "outputImageName": outputVolNode,
+            "maskImageName": inputMask,
+            "initialMeshResolution":initMeshResolution
         }
         
         # Run the N4 ITK bias field correction CLI
@@ -935,7 +946,42 @@ class MRICTRegistrationCryoLogic(ScriptedLoadableModuleLogic, unittest.TestCase)
         self.lastRoiNodeModifiedTime = roiNode.GetMTime()
         return self.clippedCTImageData
         
-    
+    def f_registrationBrainsFit2(self, inputFixedVolume, inputMovingVolume, outputVolume):
+        """
+        Perform registration using BrainsFit
+        """
+        # Set parameters
+        fixedVolumeID = inputFixedVolume.GetID()
+        movingVolumeID = inputMovingVolume.GetID()
+        outputVolumeID = outputVolume.GetID()
+        
+        self.__movingTransform = slicer.vtkMRMLBSplineTransformNode()
+        slicer.mrmlScene.AddNode(self.__movingTransform)
+                
+        parameters = {
+            "fixedVolume": fixedVolumeID,
+            "movingVolume": movingVolumeID,
+            "outputVolume": outputVolumeID,
+            "initializeTransformMode": "useMomentsAlign",
+            #"useGeometryAlign", "useCenterOfROIAlign", "useMomentsAlign"
+            "useRigid": True,
+            "useScaleVersor3D": True,
+            "useScaleSkewVersor3D": True,
+            "useAffine": True,
+            "useBSpline": True,
+            "bsplineTransform": self.__movingTransform.GetID()
+        }
+
+        print("Calling slicer.modules.brainsfit")
+        
+        self.__cliNode = None
+        cliNode = slicer.cli.runSync(slicer.modules.brainsfit, self.__cliNode, parameters)
+        
+        #self.__cliObserverTag = self.__cliNode.AddObserver('ModifiedEvent', self.processRegistrationCompletion)
+   
+   
+   
+   
     def f_registrationBrainsFit(self, inputFixedVolume, inputMovingVolume, outputVolume, maskProcessingMode, fixedBinaryVolume, movingBinaryVolume):
         """
         Perform registration using BrainsFit
@@ -958,7 +1004,7 @@ class MRICTRegistrationCryoLogic(ScriptedLoadableModuleLogic, unittest.TestCase)
             "fixedBinaryVolume": fixedBinaryVolumeID,
             "movingBinaryVolume": movingBinaryVolumeID,
             "initializeTransformMode": "useMomentsAlign",
-            #"useAlignGeometryAlign", "useCenterOfROIAlign", "useMomentsAlign"
+            #"useGeometryAlign", "useCenterOfROIAlign", "useMomentsAlign"
             "useRigid": True,
             "useScaleVersor3D": True,
             "useScaleSkewVersor3D": True,
