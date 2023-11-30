@@ -827,9 +827,7 @@ class MRICTRegistrationCryoLogic(ScriptedLoadableModuleLogic, unittest.TestCase)
         lastRoiNodeModifiedTime = 0
         
         # Segment the liver from CT using AI based segmentation module RVX
-        inputFixedVolumeMask = slicer.vtkMRMLScalarVolumeNode()
-        #Trying changing the type of node for mask
-        #inputFixedVolumeMask = slicer.vtkMRMLSegmentationNode()
+        inputFixedVolumeMask = slicer.vtkMRMLLabelMapVolumeNode()
         inputFixedVolumeMask.SetName('inputFixedVolumeMask')
         slicer.mrmlScene.AddNode(inputFixedVolumeMask)
         self.f_segmentationMask(inputFixedVolume, inputFixedVolumeMask, "cpu", "CT")
@@ -841,9 +839,7 @@ class MRICTRegistrationCryoLogic(ScriptedLoadableModuleLogic, unittest.TestCase)
         self.f_n4itkbiasfieldcorrection(inputMovingVolume, movingVolumeN4, None, [1,1,1])
         
         #Segment the liver from MRI using AI based segmentation module RVX
-        inputMovingVolumeMask = slicer.vtkMRMLScalarVolumeNode()
-        #Trying changing the type of node for mask
-        #inputMovingVolumeMask = slicer.vtkMRMLSegmentationNode()
+        inputMovingVolumeMask = slicer.vtkMRMLLabelMapVolumeNode()
         inputMovingVolumeMask.SetName('inputMovingVolumeMask')
         slicer.mrmlScene.AddNode(inputMovingVolumeMask)
         self.f_segmentationMask(movingVolumeN4, inputMovingVolumeMask, "cpu", "MRI")
@@ -853,6 +849,7 @@ class MRICTRegistrationCryoLogic(ScriptedLoadableModuleLogic, unittest.TestCase)
         maskProcessingMode = "ROI" #Specifies a mask to only consider a certain image region for the registration.  If ROIAUTO is chosen, then the mask is computed using Otsu thresholding and hole filling. If ROI is chosen then the mask has to be specified as in input.
         
         #With mask the code is working worse than without mask.
+        
         self.f_registrationBrainsFit(inputFixedVolume, movingVolumeN4, outputVolume, maskProcessingMode, inputFixedVolumeMask, inputMovingVolumeMask)
         
         # Without the masks the code is working better though the registration result is not perfect
@@ -862,6 +859,13 @@ class MRICTRegistrationCryoLogic(ScriptedLoadableModuleLogic, unittest.TestCase)
         
         stopTime = time.time()
         logging.info(f'Processing completed in {stopTime-startTime:.2f} seconds')
+        
+    def f_getMaskFromSegmentation(self, segmentationNode, referenceVolumeNode):
+        
+        maskLabelMapNode = slicer.vtkMRMLLabelMapVolumeNode()
+        slicer.mrmlscene.AddNode(maskLabelMapNode)
+        slicer.modules.segmentations.logic().ExportVisibleSegmentsToLabelmapNode(segmentationNode, maskLabelMapNode, reference)
+        return maskLabelMapNode
     
     def f_n4itkbiasfieldcorrection(self, inputVolumeNode, outputVolNode, inputMask, initMeshResolution):
         """
@@ -892,7 +896,7 @@ class MRICTRegistrationCryoLogic(ScriptedLoadableModuleLogic, unittest.TestCase)
             raise ValueError("N4BiasFilter CLI execution failed: " + errorText)
     
     
-    def f_segmentationMask(self, inputVolumeNode, outputVolumeNode, use_cudaOrCpu, modalityV):
+    def f_segmentationMask(self, inputVolumeNode, maskLabelMapNode, use_cudaOrCpu, modalityV):
         """
         Segments liver using AI-based segmentation based on the selected modality.
 
@@ -907,8 +911,29 @@ class MRICTRegistrationCryoLogic(ScriptedLoadableModuleLogic, unittest.TestCase)
         #slicer.vtkSlicerSegmentationsModuleLogic.CopyOrientedImageDataToVolumeNode(self.getClippedMasterImageData(), inputVolumeNode)
         
         try:
-            self.launchLiverSegmentation(inputVolumeNode, outputVolumeNode, use_cudaOrCpu, modalityV)
-
+            outputSegmentationScalarVolumeNode = slicer.vtkMRMLScalarVolumeNode()
+            slicer.mrmlScene.AddNode(outputSegmentationScalarVolumeNode)
+            self.launchLiverSegmentation(inputVolumeNode, outputSegmentationScalarVolumeNode, use_cudaOrCpu, modalityV)
+            
+            # Have to convert outputSegmentationScalarVolumeNode to vtkMRMLLabelMapVolumeNode
+            
+            # Get the vtkMRMLScalarVolumeNode data that we want to convert to a labelmap:
+            segmentationVolume_data = slicer.util.arrayFromVolume(outputSegmentationScalarVolumeNode)
+            segmentationVolume_data = segmentationVolume_data.astype(np.uint8())
+            
+            # Use the maskLabelMapNode which is of type vtkMRMLLabelMapVolumeNode:
+            slicer.util.updateVolumeFromArray(maskLabelMapNode, segmentationVolume_data)
+        
+            #The vtkMRMLLabelMapVolumeNode will probably have a different IJKToRAS matrix (and origin), so we need to update them with the ones from the original vtkMRMLScalarVolumeNode
+            slicer.modules.volumes.logic().CreateLabelVolumeFromVolume(slicer.mrmlScene, maskLabelMapNode, outputSegmentationScalarVolumeNode)
+            """
+            volume_matrix = vtk.vtkMatrix4x4()
+            outputSegmentationScalarVolumeNode.GetIJKToRASMatrix(volume_matrix)
+            volume_origin = outputSegmentationScalarVolumeNode.GetOrigin()
+            maskLabelMapNode.SetIJKToRASMatrix(volume_matrix)
+            maskLabelMapNode.SetOrigin(volume_origin)
+            """
+            
         except Exception as e:
             qt.QApplication.restoreOverrideCursor()
             slicer.util.errorDisplay(str(e))
@@ -946,7 +971,7 @@ class MRICTRegistrationCryoLogic(ScriptedLoadableModuleLogic, unittest.TestCase)
         self.lastRoiNodeModifiedTime = roiNode.GetMTime()
         return self.clippedCTImageData
         
-    def f_registrationBrainsFit2(self, inputFixedVolume, inputMovingVolume, outputVolume):
+    def f_registrationAffine(self, inputFixedVolume, inputMovingVolume, outputVolume):
         """
         Perform registration using BrainsFit
         """
@@ -955,8 +980,8 @@ class MRICTRegistrationCryoLogic(ScriptedLoadableModuleLogic, unittest.TestCase)
         movingVolumeID = inputMovingVolume.GetID()
         outputVolumeID = outputVolume.GetID()
         
-        self.__movingTransform = slicer.vtkMRMLBSplineTransformNode()
-        slicer.mrmlScene.AddNode(self.__movingTransform)
+        self.affineTransform = slicer.vtkMRMLLinearTransformNode()
+        slicer.mrmlScene.AddNode(self.affineTransform)
                 
         parameters = {
             "fixedVolume": fixedVolumeID,
@@ -968,11 +993,11 @@ class MRICTRegistrationCryoLogic(ScriptedLoadableModuleLogic, unittest.TestCase)
             "useScaleVersor3D": True,
             "useScaleSkewVersor3D": True,
             "useAffine": True,
-            "useBSpline": True,
-            "bsplineTransform": self.__movingTransform.GetID()
+            "useBSpline": False,
+            "linearTransform": self.affineTransform.GetID()
         }
 
-        print("Calling slicer.modules.brainsfit")
+        print("Affine registration started...")
         
         self.__cliNode = None
         cliNode = slicer.cli.runSync(slicer.modules.brainsfit, self.__cliNode, parameters)
