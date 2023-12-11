@@ -850,15 +850,20 @@ class MRICTRegistrationCryoLogic(ScriptedLoadableModuleLogic, unittest.TestCase)
         
         #inputFixedVolume = self.removeBedFromCT(inputFixedVolume, roiCT)
         
+        affineTransform = slicer.vtkMRMLLinearTransformNode()
+        affineTransform.SetName('affineTransform')
+        slicer.mrmlScene.AddNode(affineTransform)
+        
         regAffineVolume = slicer.vtkMRMLScalarVolumeNode()
         regAffineVolume.SetName('regAffineVolume')
         slicer.mrmlScene.AddNode(regAffineVolume)
-        self.f_registrationAffine(inputFixedVolume, inputMovingVolume, regAffineVolume)
+        self.f_registrationAffine(inputFixedVolume, inputMovingVolume, regAffineVolume, affineTransform)
         inputMovingVolume.SetAndObserveTransformNodeID(None)
         
         maskProcessingMode = "ROI" #Specifies a mask to only consider a certain image region for the registration.  If ROIAUTO is chosen, then the mask is computed using Otsu thresholding and hole filling. If ROI is chosen then the mask has to be specified as in input.
         
-        self.f_registrationBrainsFit(inputFixedVolume, movingVolumeN4, outputVolume, maskProcessingMode, inputFixedVolumeMask, inputMovingVolumeMask)
+        self.f_registrationBrainsFit(inputFixedVolume, movingVolumeN4, outputVolume, maskProcessingMode, inputFixedVolumeMask, inputMovingVolumeMask, affineTransform)
+        
         movingVolumeN4.SetAndObserveTransformNodeID(None)
         
         print("returned to Process")
@@ -971,7 +976,7 @@ class MRICTRegistrationCryoLogic(ScriptedLoadableModuleLogic, unittest.TestCase)
         self.lastRoiNodeModifiedTime = roiNode.GetMTime()
         return self.clippedCTImageData
         
-    def f_registrationAffine(self, inputFixedVolume, inputMovingVolume, outputVolume):
+    def f_registrationAffine(self, inputFixedVolume, inputMovingVolume, outputVolume, affineTransform):
         """
         Perform registration using BrainsFit
         """
@@ -980,8 +985,8 @@ class MRICTRegistrationCryoLogic(ScriptedLoadableModuleLogic, unittest.TestCase)
         movingVolumeID = inputMovingVolume.GetID()
         outputVolumeID = outputVolume.GetID()
         
-        self.affineTransform = slicer.vtkMRMLLinearTransformNode()
-        slicer.mrmlScene.AddNode(self.affineTransform)
+        #self.affineTransform = slicer.vtkMRMLLinearTransformNode()
+        #slicer.mrmlScene.AddNode(self.affineTransform)
                 
         parameters = {
             "fixedVolume": fixedVolumeID,
@@ -993,18 +998,18 @@ class MRICTRegistrationCryoLogic(ScriptedLoadableModuleLogic, unittest.TestCase)
             "useScaleVersor3D": True,
             "useScaleSkewVersor3D": True,
             "useAffine": True,
-            "linearTransform": self.affineTransform.GetID()
+            "linearTransform": affineTransform.GetID()
         }
 
         print("Affine registration started...")
         
         self.__cliNode = None
         cliNode = slicer.cli.runSync(slicer.modules.brainsfit, self.__cliNode, parameters)
-
+        #return self.affineTransform
    
    
-   
-    def f_registrationBrainsFit(self, inputFixedVolume, inputMovingVolume, outputVolume, maskProcessingMode, fixedBinaryVolume, movingBinaryVolume):
+    
+    def f_registrationBrainsFit(self, inputFixedVolume, inputMovingVolume, outputVolume, maskProcessingMode, fixedBinaryVolume, movingBinaryVolume, affineTransform):
         """
         Perform registration using BrainsFit
         """
@@ -1014,6 +1019,7 @@ class MRICTRegistrationCryoLogic(ScriptedLoadableModuleLogic, unittest.TestCase)
         outputVolumeID = outputVolume.GetID()
         fixedBinaryVolumeID = fixedBinaryVolume.GetID()
         movingBinaryVolumeID = movingBinaryVolume.GetID()
+        affineTransformID = affineTransform.GetID()
         
         self.__movingTransform = slicer.vtkMRMLBSplineTransformNode()
         slicer.mrmlScene.AddNode(self.__movingTransform)
@@ -1025,13 +1031,8 @@ class MRICTRegistrationCryoLogic(ScriptedLoadableModuleLogic, unittest.TestCase)
             "maskProcessingMode": maskProcessingMode,
             "fixedBinaryVolume": fixedBinaryVolumeID,
             "movingBinaryVolume": movingBinaryVolumeID,
-            "initializeTransformMode": "useMomentsAlign",
-            #"useGeometryAlign", "useCenterOfROIAlign", "useMomentsAlign"
-            "useRigid": True,
-            "useScaleVersor3D": True,
-            "useScaleSkewVersor3D": True,
-            "useAffine": True,
             "useBSpline": True,
+            "initialTransform": affineTransformID,
             "bsplineTransform": self.__movingTransform.GetID()
         }
 
@@ -1039,9 +1040,8 @@ class MRICTRegistrationCryoLogic(ScriptedLoadableModuleLogic, unittest.TestCase)
         
         self.__cliNode = None
         cliNode = slicer.cli.runSync(slicer.modules.brainsfit, self.__cliNode, parameters)
-        
-        #self.__cliObserverTag = self.__cliNode.AddObserver('ModifiedEvent', self.processRegistrationCompletion)
-        
+    
+    
     
     @classmethod
     def createUNetModel(cls, device):
